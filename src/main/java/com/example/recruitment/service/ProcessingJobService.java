@@ -91,12 +91,21 @@ public class ProcessingJobService {
         JobRequirements requirements = jobDescriptionParser.parse(jobDescriptionText);
         ExcelParseResult parseResult = parseExcel(excelFile);
 
+        // processedCandidates starts pre-populated with the excel-validation
+        // failures, not zero: those rows are already "done" (failed) before
+        // a single Kafka message goes out. That's what makes
+        // processedCandidates a uniform "how many of totalCandidates are
+        // done, for any reason" counter from the very first moment - Step
+        // 8's atomic completion check (below and in the consumer) never
+        // needs to special-case "no valid candidates" separately, it's just
+        // the case where this starting value already equals totalCandidates.
         ProcessingJob job = processingJobRepository.save(ProcessingJob.builder()
                 .jobTitle(requirements.jobTitle())
                 .requiredSkills(CsvSkills.format(requirements.requiredSkills()))
                 .minExperience(requirements.minExperience())
                 .maxExperience(requirements.maxExperience())
                 .totalCandidates(parseResult.candidates().size() + parseResult.errors().size())
+                .processedCandidates(parseResult.errors().size())
                 .failedCandidates(parseResult.errors().size())
                 .build());
 
@@ -105,15 +114,13 @@ public class ProcessingJobService {
             candidateEventProducer.publish(new CandidateProcessingEvent(job.getId(), candidate.getId()));
         }
 
-        if (parseResult.candidates().isEmpty()) {
-            // Nothing was published, so nothing will ever arrive at the
-            // consumer to move this job past QUEUED - every row in the
-            // spreadsheet failed validation, so there's genuinely nothing
-            // left to process. Completing it here (rather than leaving it
-            // stuck QUEUED forever) is the honest state, not a shortcut.
+        if (job.getProcessedCandidates() >= job.getTotalCandidates()) {
+            // Every row failed validation (or the job legitimately has zero
+            // candidates) - nothing was published, so nothing will ever
+            // arrive at the consumer to move this job forward. Completing
+            // it now is the honest state, not a shortcut.
+            processingJobRepository.markCompleted(job.getId(), Instant.now());
             job.setStatus(ProcessingStatus.COMPLETED);
-            job.setCompletedAt(Instant.now());
-            processingJobRepository.save(job);
         }
 
         return new CreateProcessingJobResponse(job.getId(), job.getStatus(), job.getTotalCandidates());

@@ -2,7 +2,6 @@ package com.example.recruitment.kafka;
 
 import com.example.recruitment.domain.Candidate;
 import com.example.recruitment.domain.ProcessingJob;
-import com.example.recruitment.domain.ProcessingStatus;
 import com.example.recruitment.dto.CandidateProcessingEvent;
 import com.example.recruitment.dto.CsvSkills;
 import com.example.recruitment.dto.JobRequirements;
@@ -65,21 +64,22 @@ public class CandidateProcessingConsumer {
      * this one application, each behaving as a separate group member.
      * With the topic's 3 partitions (Step 6), this actually engages all of
      * them in parallel - proof that partitions, not just consumers, are
-     * the real ceiling on parallelism (1 consumer thread with 3 partitions
-     * would idle 2 of them; 3 consumer threads with 1 partition would
-     * leave 2 threads permanently idle).
+     * the real ceiling on parallelism.
      * <p>
-     * @Transactional wraps everything below in one DB transaction - the
-     * MatchResult insert and the job's counter update either both commit
-     * or neither does. It does NOT extend to the Kafka side: committing
-     * this transaction and committing the consumed offset are two
-     * separate operations against two separate systems, with no
-     * distributed transaction spanning both (that would need Kafka
-     * transactions chained to the DB transaction manager - explicitly the
-     * kind of complexity your spec keeps out of V1). The practical
-     * consequence: a crash between this method returning and the offset
-     * commit means Kafka redelivers the message - which is exactly why
-     * the idempotency check below exists.
+     * @Transactional wraps everything below in one DB transaction. It does
+     * NOT extend to the Kafka side - see CandidateEventProducer's Javadoc
+     * for the producer-side half of that story, and the idempotency check
+     * below for why a redelivered message is still handled correctly.
+     * <p>
+     * This method itself never lets an "ordinary" failure (bad match,
+     * missing referenced row) escape as an exception - see matchAndPersist
+     * below. That's deliberate: an uncaught exception here would fall back
+     * to Kafka's default error handling, which (Step 7 found out the hard
+     * way) retries a few times with no backoff and then silently skips the
+     * message forever, leaving no record it ever existed and potentially
+     * stranding the job below its completion threshold permanently. Catching
+     * it and recording it as a counted failure instead means the job can
+     * always still reach COMPLETED, and the failure is visible, not lost.
      */
     @KafkaListener(topics = KafkaTopics.CANDIDATE_PROCESSING, groupId = "candidate-processing-group", concurrency = "3")
     @Transactional
@@ -91,69 +91,95 @@ public class CandidateProcessingConsumer {
             return;
         }
 
-        ProcessingJob job = processingJobRepository.findById(event.processingJobId())
-                .orElseThrow(() -> new IllegalStateException(
-                        "Received an event for unknown processing job " + event.processingJobId()));
-        Candidate candidate = candidateRepository.findById(event.candidateId())
-                .orElseThrow(() -> new IllegalStateException(
-                        "Received an event for unknown candidate " + event.candidateId()));
-
-        JobRequirements requirements = new JobRequirements(
-                job.getJobTitle(),
-                CsvSkills.parse(job.getRequiredSkills()),
-                job.getMinExperience(),
-                job.getMaxExperience()
-        );
-        CandidateProfile profile = new CandidateProfile(
-                CsvSkills.parse(candidate.getSkills()), candidate.getExperience());
-
-        com.example.recruitment.matching.MatchResult outcome = candidateMatcher.match(profile, requirements);
-
-        try {
-            matchResultRepository.save(com.example.recruitment.domain.MatchResult.builder()
-                    .processingJobId(job.getId())
-                    .candidateId(candidate.getId())
-                    .skillScore(outcome.skillScore())
-                    .experienceScore(outcome.experienceScore())
-                    .finalScore(outcome.finalScore())
-                    .matchedSkills(CsvSkills.format(outcome.matchedSkills()))
-                    .missingSkills(CsvSkills.format(outcome.missingSkills()))
-                    .build());
-        } catch (DataIntegrityViolationException duplicate) {
-            // The rare race the exists()-check above didn't catch: another
-            // thread inserted this same candidate's result microseconds
-            // earlier. The unique constraint (see domain.MatchResult) just
-            // did its job - treat it exactly like the check above would
-            // have, and don't touch the counters a second time.
-            log.info("Duplicate MatchResult rejected by the database for candidate {} in job {} - already scored",
-                    event.candidateId(), event.processingJobId());
-            return;
+        Outcome outcome = matchAndPersist(event);
+        if (outcome == Outcome.DUPLICATE) {
+            return; // already counted by whichever thread won the DB-level race
         }
 
-        updateJobProgress(job, outcome.finalScore() >= MATCH_THRESHOLD);
+        processingJobRepository.recordCandidateOutcome(
+                event.processingJobId(),
+                outcome == Outcome.MATCHED ? 1 : 0,
+                outcome == Outcome.FAILED ? 1 : 0);
+        processingJobRepository.markProcessingIfQueued(event.processingJobId());
+
+        ProcessingJob refreshed = processingJobRepository.findById(event.processingJobId()).orElseThrow();
+        if (refreshed.getProcessedCandidates() >= refreshed.getTotalCandidates()) {
+            processingJobRepository.markCompleted(event.processingJobId(), Instant.now());
+        }
     }
 
     /**
-     * Deliberately naive for this step: read the job's counters, add one,
-     * write them back. Under real concurrency (three threads, per the
-     * @KafkaListener concurrency above, all potentially updating the same
-     * job's row at once) this is a textbook lost-update race - two threads
-     * can both read processedCandidates=41, both compute 42, and one
-     * increment vanishes. Step 7's write-up reports what actually happens
-     * when this runs at scale; Step 8 is where this gets fixed properly.
+     * Two genuinely different failure sources here, handled differently on
+     * purpose:
+     * <p>
+     * - candidateMatcher.match() throwing, or the referenced job/candidate
+     *   not existing (which Step 7's producer fix makes rare, but this
+     *   stays defensive) - pure application-level failures. The database
+     *   session is completely unaffected by either, so it's safe to catch
+     *   them, record a FAILED outcome, and keep going in the same
+     *   transaction.
+     * - matchResultRepository.save() throwing DataIntegrityViolationException
+     *   - the unique constraint (domain.MatchResult) rejecting a duplicate
+     *   insert that the exists()-check above didn't catch (two threads
+     *   racing on the same redelivered message). This is not a failure to
+     *   record - the candidate WAS already scored, by the thread that won.
+     * <p>
+     * Anything else - a genuine database outage, say - is deliberately NOT
+     * caught here. If the database itself is unhealthy, attempting to
+     * record a "failed" outcome would fail too, and the exception
+     * propagates out of the listener, falling back to Kafka's default
+     * retry - the right behavior for a transient infrastructure problem,
+     * where retrying might actually succeed once the database recovers.
+     * Distinguishing that from a truly permanent failure (and giving up
+     * gracefully via a dead letter topic) is exactly the "complex retry/DLT
+     * architecture" your spec explicitly keeps out of V1.
      */
-    private void updateJobProgress(ProcessingJob job, boolean matched) {
-        job.setProcessedCandidates(job.getProcessedCandidates() + 1);
-        if (matched) {
-            job.setMatchedCandidates(job.getMatchedCandidates() + 1);
+    private Outcome matchAndPersist(CandidateProcessingEvent event) {
+        double finalScore;
+        try {
+            ProcessingJob job = processingJobRepository.findById(event.processingJobId())
+                    .orElseThrow(() -> new IllegalStateException(
+                            "Received an event for unknown processing job " + event.processingJobId()));
+            Candidate candidate = candidateRepository.findById(event.candidateId())
+                    .orElseThrow(() -> new IllegalStateException(
+                            "Received an event for unknown candidate " + event.candidateId()));
+
+            JobRequirements requirements = new JobRequirements(
+                    job.getJobTitle(),
+                    CsvSkills.parse(job.getRequiredSkills()),
+                    job.getMinExperience(),
+                    job.getMaxExperience()
+            );
+            CandidateProfile profile = new CandidateProfile(
+                    CsvSkills.parse(candidate.getSkills()), candidate.getExperience());
+
+            com.example.recruitment.matching.MatchResult matched = candidateMatcher.match(profile, requirements);
+
+            matchResultRepository.save(com.example.recruitment.domain.MatchResult.builder()
+                    .processingJobId(job.getId())
+                    .candidateId(candidate.getId())
+                    .skillScore(matched.skillScore())
+                    .experienceScore(matched.experienceScore())
+                    .finalScore(matched.finalScore())
+                    .matchedSkills(CsvSkills.format(matched.matchedSkills()))
+                    .missingSkills(CsvSkills.format(matched.missingSkills()))
+                    .build());
+
+            finalScore = matched.finalScore();
+        } catch (DataIntegrityViolationException duplicate) {
+            log.info("Duplicate MatchResult rejected by the database for candidate {} in job {} - already scored",
+                    event.candidateId(), event.processingJobId());
+            return Outcome.DUPLICATE;
+        } catch (RuntimeException failure) {
+            log.error("Failed to process candidate {} for job {}: {}",
+                    event.candidateId(), event.processingJobId(), failure.getMessage(), failure);
+            return Outcome.FAILED;
         }
-        if (job.getStatus() == ProcessingStatus.QUEUED) {
-            job.setStatus(ProcessingStatus.PROCESSING);
-        }
-        if (job.getProcessedCandidates() + job.getFailedCandidates() >= job.getTotalCandidates()) {
-            job.setStatus(ProcessingStatus.COMPLETED);
-            job.setCompletedAt(Instant.now());
-        }
-        processingJobRepository.save(job);
+
+        return finalScore >= MATCH_THRESHOLD ? Outcome.MATCHED : Outcome.NOT_MATCHED;
+    }
+
+    private enum Outcome {
+        MATCHED, NOT_MATCHED, FAILED, DUPLICATE
     }
 }

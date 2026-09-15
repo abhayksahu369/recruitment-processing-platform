@@ -37,15 +37,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * parallel) drain the real embedded Kafka topic, and check what actually
  * happened - not what should happen in theory.
  * <p>
- * The primary assertion waits on MatchResultRepository, not on the job's
- * status/counters. That's deliberate: a MatchResult row existing for every
- * candidate is a deterministic fact (the unique constraint + idempotency
- * check make it so), whereas ProcessingJob's processedCandidates counter
- * is updated with a plain read-modify-write under real concurrent access
- * (see CandidateProcessingConsumer's Javadoc) and is not guaranteed to be
- * race-free yet - that's Step 8's job. This test reports the counters it
- * actually observed rather than asserting a value that might legitimately
- * not hold today.
+ * The primary wait is on MatchResultRepository rather than the job's own
+ * status - that row existing is the fact this whole pipeline exists to
+ * produce. In Step 7, the job's processed/matched counters and COMPLETED
+ * status were only ever printed here, never asserted: they were updated
+ * with a plain read-modify-write under real concurrent consumer threads
+ * and were not reliable. Step 8 replaced that with atomic database
+ * updates (see ProcessingJobRepository), so these are now real
+ * assertions, not just observations - this test is what proves that fix
+ * actually holds at 10, 100, and 1000 candidates, not just in theory.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -108,11 +108,6 @@ class CandidateProcessingConsumerTest {
                 .andReturn().getResponse().getContentAsString();
         JsonNode statusResponse = objectMapper.readTree(statusJson);
 
-        // Reported, not asserted: whether processed/matched match
-        // candidateCount exactly depends on whether the counter race
-        // (documented in CandidateProcessingConsumer) actually manifested
-        // during this run. Either way, every candidate WAS correctly
-        // scored - see the assertion above.
         System.out.printf(
                 "[%d candidates] elapsed=%dms job.status=%s job.processed=%d job.matched=%d "
                         + "actualMatchResultRows=%d actualMatchedByScore=%d%n",
@@ -121,6 +116,13 @@ class CandidateProcessingConsumerTest {
                 results.size(), actuallyMatched);
 
         assertThat(results).hasSize(candidateCount);
+        // Now real assertions (Step 8): the atomic counter updates mean
+        // these are no longer racy, so there's no reason not to hold them
+        // to the exact, correct values.
+        assertThat(statusResponse.get("status").asText()).isEqualTo("COMPLETED");
+        assertThat(statusResponse.get("processed").asInt()).isEqualTo(candidateCount);
+        assertThat(statusResponse.get("matched").asLong()).isEqualTo(actuallyMatched);
+        assertThat(statusResponse.get("failed").asInt()).isZero();
     }
 
     /**

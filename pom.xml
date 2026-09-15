@@ -86,6 +86,27 @@
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
 			</plugin>
+			<!-- reuseForks=false: give every test class its own fresh JVM.
+			     Discovered why this matters the hard way - two test classes
+			     that each start an embedded Kafka broker in their own Spring
+			     context (ProcessingJobControllerTest's and
+			     CandidateProcessingFailureTest's @MockitoSpyBean forces a
+			     distinct context from the rest) interfered with each other
+			     when Surefire reused one JVM across both: the second
+			     broker/consumer group came up but never actually received
+			     any messages, even though each test passes cleanly alone.
+			     Root-causing exactly why two independent embedded KRaft
+			     brokers collide inside one JVM wasn't worth chasing further -
+			     process-level isolation is the standard, well-understood fix
+			     for exactly this class of problem. -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<reuseForks>false</reuseForks>
+					<forkCount>1</forkCount>
+				</configuration>
+			</plugin>
 		</plugins>
 	</build>
 
