@@ -95,29 +95,22 @@ class ProcessingJobControllerTest {
                 .andReturn().getResponse().getContentAsString();
 
         JsonNode createResponse = objectMapper.readTree(createResponseJson);
-        // Honest state for this step: nothing has been matched yet, because
-        // nothing consumes candidate-processing until Step 7. The whole
-        // point of this test is proving that's true, not hiding it.
+        // Still deterministic: this value is read from the in-memory job
+        // object before the transaction (and therefore before any consumer
+        // could possibly see the row) commits - the real, running
+        // CandidateProcessingConsumer added in Step 7 cannot have touched
+        // it yet no matter how fast it is.
         assertThat(createResponse.get("status").asText()).isEqualTo("QUEUED");
         assertThat(createResponse.get("totalCandidates").asInt()).isEqualTo(3);
         UUID jobId = UUID.fromString(createResponse.get("jobId").asText());
 
-        String statusResponseJson = mockMvc.perform(get("/api/processing/jobs/{jobId}", jobId))
-                .andExpect(status().isOk())
-                .andReturn().getResponse().getContentAsString();
-
-        JsonNode statusResponse = objectMapper.readTree(statusResponseJson);
-        assertThat(statusResponse.get("status").asText()).isEqualTo("QUEUED");
-        assertThat(statusResponse.get("processed").asInt()).isEqualTo(0);
-        assertThat(statusResponse.get("matched").asInt()).isEqualTo(0);
-        assertThat(statusResponse.get("failed").asInt()).isEqualTo(0);
-
-        // Nothing has produced a MatchResult yet either - results is empty,
-        // not missing/erroring, since the job itself does exist.
-        String resultsResponseJson = mockMvc.perform(get("/api/processing/jobs/{jobId}/results", jobId))
-                .andExpect(status().isOk())
-                .andReturn().getResponse().getContentAsString();
-        assertThat(objectMapper.readTree(resultsResponseJson)).isEmpty();
+        // Deliberately NOT asserting GET status/results here anymore: as of
+        // Step 7, a real consumer is running in this same app and may have
+        // already matched some or all of these candidates by the time this
+        // line runs - that's correct, desired behavior, not a bug, but it
+        // makes "processed == 0 right after POST" a race rather than a
+        // fact. CandidateProcessingConsumerTest covers the real, eventual
+        // outcome properly with Awaitility instead of a same-instant read.
 
         // The three candidate rows exist in the database already - Kafka
         // only carries their ids, not their data (see CandidateProcessingEvent).

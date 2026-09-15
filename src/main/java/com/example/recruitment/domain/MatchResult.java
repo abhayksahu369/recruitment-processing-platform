@@ -7,6 +7,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -31,9 +32,22 @@ import java.util.UUID;
  * matching-engine formulas exactly (Step 4). Percentage formatting (e.g.
  * 0.92 -> "92.0") is a presentation concern that belongs at the API/DTO
  * boundary, not in this table.
+ * <p>
+ * The unique constraint below (added in Step 7) is the hard guarantee
+ * behind the Kafka consumer's idempotency: Kafka only promises
+ * at-least-once delivery, so the same CandidateProcessingEvent can arrive
+ * twice. The consumer checks for an existing result first, but this
+ * constraint is what actually prevents a duplicate row if two threads
+ * ever raced past that check at the same moment.
  */
 @Entity
-@Table(name = "match_results")
+@Table(
+        name = "match_results",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_match_result_job_candidate",
+                columnNames = {"processing_job_id", "candidate_id"}
+        )
+)
 @Getter
 @Setter
 @NoArgsConstructor

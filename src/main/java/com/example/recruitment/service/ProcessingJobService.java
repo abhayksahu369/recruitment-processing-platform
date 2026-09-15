@@ -2,6 +2,7 @@ package com.example.recruitment.service;
 
 import com.example.recruitment.domain.Candidate;
 import com.example.recruitment.domain.ProcessingJob;
+import com.example.recruitment.domain.ProcessingStatus;
 import com.example.recruitment.dto.CandidateResultResponse;
 import com.example.recruitment.dto.CreateProcessingJobResponse;
 import com.example.recruitment.dto.CsvSkills;
@@ -23,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -101,6 +103,17 @@ public class ProcessingJobService {
         for (ParsedCandidate parsed : parseResult.candidates()) {
             Candidate candidate = saveCandidate(job, parsed);
             candidateEventProducer.publish(new CandidateProcessingEvent(job.getId(), candidate.getId()));
+        }
+
+        if (parseResult.candidates().isEmpty()) {
+            // Nothing was published, so nothing will ever arrive at the
+            // consumer to move this job past QUEUED - every row in the
+            // spreadsheet failed validation, so there's genuinely nothing
+            // left to process. Completing it here (rather than leaving it
+            // stuck QUEUED forever) is the honest state, not a shortcut.
+            job.setStatus(ProcessingStatus.COMPLETED);
+            job.setCompletedAt(Instant.now());
+            processingJobRepository.save(job);
         }
 
         return new CreateProcessingJobResponse(job.getId(), job.getStatus(), job.getTotalCandidates());
