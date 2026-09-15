@@ -1,19 +1,34 @@
 package com.example.recruitment.controller;
 
+import com.example.recruitment.domain.Candidate;
+import com.example.recruitment.kafka.KafkaTopics;
+import com.example.recruitment.repository.CandidateRepository;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.kafka.test.EmbeddedKafkaBroker;
+import org.springframework.kafka.test.context.EmbeddedKafka;
+import org.springframework.kafka.test.utils.KafkaTestUtils;
 import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -22,15 +37,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * A real, full-stack test: real Spring MVC dispatch, real
- * ProcessingJobService, real parsers, real matcher, real repositories,
- * real (in-memory) database. Nothing here is mocked - this is what proves
- * the entire synchronous pipeline described in section 5 of the spec
- * ("upload Excel, provide job description, process candidates, store
- * results, retrieve ranked candidates") actually works end to end, not
- * just that its pieces compile.
+ * ProcessingJobService, real parsers, real repositories, real (in-memory)
+ * database, and now a real (embedded, in-process) Kafka broker - no
+ * mocking of any of it. @EmbeddedKafka starts an actual broker for this
+ * test class only; the @TestPropertySource line points the app's own
+ * KafkaTemplate at that broker instead of the real localhost:9092 from
+ * application.properties, which wouldn't exist in a test environment.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
+@EmbeddedKafka(partitions = 3, topics = {KafkaTopics.CANDIDATE_PROCESSING})
+@TestPropertySource(properties = "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}")
 class ProcessingJobControllerTest {
 
     private static final String JOB_DESCRIPTION = """
@@ -49,8 +66,23 @@ class ProcessingJobControllerTest {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private EmbeddedKafkaBroker embeddedKafkaBroker;
+
+    @Autowired
+    private CandidateRepository candidateRepository;
+
+    private Consumer<String, String> testConsumer;
+
+    @AfterEach
+    void closeConsumer() {
+        if (testConsumer != null) {
+            testConsumer.close();
+        }
+    }
+
     @Test
-    void uploadsCandidates_processesThemSynchronously_andRanksResultsByFinalScore() throws Exception {
+    void createsJobAsynchronously_savesCandidates_andPublishesOneEventPerCandidateToKafka() throws Exception {
         MockMultipartFile candidatesPart = new MockMultipartFile(
                 "candidates", "candidates.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -63,36 +95,52 @@ class ProcessingJobControllerTest {
                 .andReturn().getResponse().getContentAsString();
 
         JsonNode createResponse = objectMapper.readTree(createResponseJson);
-        assertThat(createResponse.get("status").asText()).isEqualTo("COMPLETED");
+        // Honest state for this step: nothing has been matched yet, because
+        // nothing consumes candidate-processing until Step 7. The whole
+        // point of this test is proving that's true, not hiding it.
+        assertThat(createResponse.get("status").asText()).isEqualTo("QUEUED");
         assertThat(createResponse.get("totalCandidates").asInt()).isEqualTo(3);
-        String jobId = createResponse.get("jobId").asText();
+        UUID jobId = UUID.fromString(createResponse.get("jobId").asText());
 
         String statusResponseJson = mockMvc.perform(get("/api/processing/jobs/{jobId}", jobId))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
 
         JsonNode statusResponse = objectMapper.readTree(statusResponseJson);
-        assertThat(statusResponse.get("status").asText()).isEqualTo("COMPLETED");
-        assertThat(statusResponse.get("totalCandidates").asInt()).isEqualTo(3);
-        assertThat(statusResponse.get("processed").asInt()).isEqualTo(3);
+        assertThat(statusResponse.get("status").asText()).isEqualTo("QUEUED");
+        assertThat(statusResponse.get("processed").asInt()).isEqualTo(0);
+        assertThat(statusResponse.get("matched").asInt()).isEqualTo(0);
         assertThat(statusResponse.get("failed").asInt()).isEqualTo(0);
-        // Rahul (0.68) and Neha (0.84) clear the 0.5 threshold; Amit (0.36) doesn't.
-        assertThat(statusResponse.get("matched").asInt()).isEqualTo(2);
 
+        // Nothing has produced a MatchResult yet either - results is empty,
+        // not missing/erroring, since the job itself does exist.
         String resultsResponseJson = mockMvc.perform(get("/api/processing/jobs/{jobId}/results", jobId))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
+        assertThat(objectMapper.readTree(resultsResponseJson)).isEmpty();
 
-        JsonNode results = objectMapper.readTree(resultsResponseJson);
-        assertThat(results).hasSize(3);
-        // Ranked by finalScore descending: Neha (84.0), Rahul (68.0), Amit (36.0).
-        assertThat(results.get(0).get("candidateId").asText()).isEqualTo("C003");
-        assertThat(results.get(0).get("name").asText()).isEqualTo("Neha");
-        assertThat(results.get(0).get("finalScore").asDouble()).isEqualTo(84.0);
-        assertThat(results.get(1).get("candidateId").asText()).isEqualTo("C001");
-        assertThat(results.get(1).get("finalScore").asDouble()).isEqualTo(68.0);
-        assertThat(results.get(2).get("candidateId").asText()).isEqualTo("C002");
-        assertThat(results.get(2).get("finalScore").asDouble()).isEqualTo(36.0);
+        // The three candidate rows exist in the database already - Kafka
+        // only carries their ids, not their data (see CandidateProcessingEvent).
+        List<Candidate> savedCandidates = candidateRepository.findByProcessingJob_Id(jobId);
+        assertThat(savedCandidates).hasSize(3);
+
+        // Now prove the events actually reached the topic: a raw consumer,
+        // subscribed to the whole topic, should see exactly 3 messages,
+        // one per candidate, each keyed by that candidate's id and carrying
+        // this job's id in its JSON body.
+        testConsumer = createTestConsumer();
+        testConsumer.subscribe(List.of(KafkaTopics.CANDIDATE_PROCESSING));
+        ConsumerRecords<String, String> records =
+                KafkaTestUtils.getRecords(testConsumer, Duration.ofSeconds(10));
+
+        assertThat(records.count()).isEqualTo(3);
+        List<UUID> savedCandidateIds = savedCandidates.stream().map(Candidate::getId).toList();
+        for (ConsumerRecord<String, String> record : records) {
+            assertThat(UUID.fromString(record.key())).isIn(savedCandidateIds);
+            assertThat(record.value())
+                    .contains("\"processingJobId\":\"" + jobId + "\"")
+                    .contains("\"candidateId\":\"" + record.key() + "\"");
+        }
     }
 
     @Test
@@ -110,8 +158,15 @@ class ProcessingJobControllerTest {
 
     @Test
     void statusForAnUnknownJobId_returns404() throws Exception {
-        mockMvc.perform(get("/api/processing/jobs/{jobId}", java.util.UUID.randomUUID()))
+        mockMvc.perform(get("/api/processing/jobs/{jobId}", UUID.randomUUID()))
                 .andExpect(status().isNotFound());
+    }
+
+    private Consumer<String, String> createTestConsumer() {
+        var props = KafkaTestUtils.consumerProps("test-verifier", "true", embeddedKafkaBroker);
+        props.put(org.apache.kafka.clients.consumer.ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        return new org.apache.kafka.clients.consumer.KafkaConsumer<>(
+                props, new StringDeserializer(), new StringDeserializer());
     }
 
     private static byte[] sampleWorkbookBytes() throws IOException {
