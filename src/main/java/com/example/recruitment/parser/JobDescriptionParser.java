@@ -1,10 +1,10 @@
 package com.example.recruitment.parser;
 
+import com.example.recruitment.dto.CsvSkills;
 import com.example.recruitment.dto.JobRequirements;
 import com.example.recruitment.exception.JobDescriptionParseException;
 import org.springframework.stereotype.Component;
 
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.Matcher;
@@ -50,7 +50,7 @@ public class JobDescriptionParser {
                 .orElseThrow(() -> new JobDescriptionParseException("Job description has no title line"));
 
         List<String> requiredSkills = extractLineAfterLabel(lines, SKILLS_LABEL)
-                .map(JobDescriptionParser::splitCsv)
+                .map(CsvSkills::parse)
                 .filter(skills -> !skills.isEmpty())
                 .orElseThrow(() -> new JobDescriptionParseException(
                         "Job description must have a '" + SKILLS_LABEL + "' line "
@@ -89,12 +89,5 @@ public class JobDescriptionParser {
             }
         }
         return Optional.empty();
-    }
-
-    private static List<String> splitCsv(String raw) {
-        return Arrays.stream(raw.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .toList();
     }
 }

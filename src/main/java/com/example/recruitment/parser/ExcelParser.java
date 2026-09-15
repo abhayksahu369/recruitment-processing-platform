@@ -1,6 +1,7 @@
 package com.example.recruitment.parser;
 
 import com.example.recruitment.dto.CandidateRowError;
+import com.example.recruitment.dto.CsvSkills;
 import com.example.recruitment.dto.ExcelParseResult;
 import com.example.recruitment.dto.ParsedCandidate;
 import com.example.recruitment.exception.MalformedExcelException;
@@ -16,7 +17,6 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -131,7 +131,7 @@ public class ExcelParser {
         if (!issues.isEmpty()) {
             return null;
         }
-        return new ParsedCandidate(candidateId, name, email, splitCsv(skillsRaw), experience);
+        return new ParsedCandidate(candidateId, name, email, CsvSkills.parse(skillsRaw), experience);
     }
 
     private static boolean isBlankRow(Row row, DataFormatter formatter) {
@@ -149,12 +149,5 @@ public class ExcelParser {
     private static String cellText(Row row, int columnIndex, DataFormatter formatter) {
         Cell cell = row.getCell(columnIndex);
         return cell == null ? "" : formatter.formatCellValue(cell).trim();
-    }
-
-    private static List<String> splitCsv(String raw) {
-        return Arrays.stream(raw.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .toList();
     }
 }
