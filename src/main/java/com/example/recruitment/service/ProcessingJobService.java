@@ -21,6 +21,8 @@ import com.example.recruitment.parser.JobDescriptionParser;
 import com.example.recruitment.repository.CandidateRepository;
 import com.example.recruitment.repository.MatchResultRepository;
 import com.example.recruitment.repository.ProcessingJobRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -53,6 +55,8 @@ import java.util.stream.Collectors;
  */
 @Service
 public class ProcessingJobService {
+
+    private static final Logger log = LoggerFactory.getLogger(ProcessingJobService.class);
 
     /**
      * Matches Step 8's threshold in CandidateProcessingConsumer exactly.
@@ -144,6 +148,9 @@ public class ProcessingJobService {
             job.setStatus(ProcessingStatus.COMPLETED);
         }
 
+        log.info("Created processing job {} ({}): {} candidates, {} rejected at upload, status={}",
+                job.getId(), job.getJobTitle(), job.getTotalCandidates(), job.getFailedCandidates(), job.getStatus());
+
         return new CreateProcessingJobResponse(job.getId(), job.getStatus(), job.getTotalCandidates());
     }
 
@@ -203,6 +210,9 @@ public class ProcessingJobService {
         job.setStatus(ProcessingStatus.COMPLETED);
         job.setCompletedAt(Instant.now());
         processingJobRepository.save(job);
+
+        log.info("Synchronously processed job {} ({}): {} candidates, {} matched",
+                job.getId(), job.getJobTitle(), job.getTotalCandidates(), matchedCount);
 
         return new CreateProcessingJobResponse(job.getId(), job.getStatus(), job.getTotalCandidates());
     }
