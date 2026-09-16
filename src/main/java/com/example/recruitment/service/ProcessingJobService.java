@@ -24,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -129,13 +130,25 @@ public class ProcessingJobService {
     @Transactional(readOnly = true)
     public ProcessingJobStatusResponse getStatus(UUID jobId) {
         ProcessingJob job = findJobOrThrow(jobId);
+
+        // While still running, "duration" is elapsed-so-far, not a fixed
+        // final number - completedAt is null until the job actually
+        // finishes, so we measure against now() instead.
+        Instant end = job.getCompletedAt() != null ? job.getCompletedAt() : Instant.now();
+        long durationMillis = Duration.between(job.getCreatedAt(), end).toMillis();
+        double recordsPerSecond = durationMillis > 0
+                ? job.getProcessedCandidates() / (durationMillis / 1000.0)
+                : 0.0;
+
         return new ProcessingJobStatusResponse(
                 job.getId(),
                 job.getStatus(),
                 job.getTotalCandidates(),
                 job.getProcessedCandidates(),
                 job.getMatchedCandidates(),
-                job.getFailedCandidates()
+                job.getFailedCandidates(),
+                durationMillis,
+                recordsPerSecond
         );
     }
 

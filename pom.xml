@@ -15,6 +15,12 @@
 	<description>Bulk Recruitment Processing Platform</description>
 	<properties>
 		<java.version>17</java.version>
+		<!-- Overridable default: mvn test -DexcludedGroups= -Dgroups=benchmark
+		     runs the excluded benchmark tests instead. A literal value here
+		     (rather than this property reference) would NOT be overridable
+		     by -D on the command line at all - Maven only lets -D win over a
+		     ${property} placeholder, never over a hardcoded literal. -->
+		<excludedGroups>benchmark</excludedGroups>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -105,6 +111,12 @@
 				<configuration>
 					<reuseForks>false</reuseForks>
 					<forkCount>1</forkCount>
+					<!-- Step 9's benchmark tests (@Tag("benchmark")) are real but
+					     slow - a 100k-candidate run takes real wall-clock minutes.
+					     Excluded from the default `mvn test` so ordinary
+					     development iteration stays fast; run them explicitly
+					     with `mvn test -DexcludedGroups= -Dgroups=benchmark`. -->
+					<excludedGroups>${excludedGroups}</excludedGroups>
 				</configuration>
 			</plugin>
 		</plugins>

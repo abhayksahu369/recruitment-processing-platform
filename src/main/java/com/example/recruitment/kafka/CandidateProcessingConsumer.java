@@ -60,11 +60,14 @@ public class CandidateProcessingConsumer {
      * one member of the group at a time, which is *why* a consumer group
      * is the unit of parallelism, not the individual consumer.
      * <p>
-     * concurrency = "3": tells Spring Kafka to run 3 listener threads in
+     * concurrency: tells Spring Kafka how many listener threads to run in
      * this one application, each behaving as a separate group member.
-     * With the topic's 3 partitions (Step 6), this actually engages all of
-     * them in parallel - proof that partitions, not just consumers, are
-     * the real ceiling on parallelism.
+     * Pulled from a property (default 3, matching the topic's 3 partitions
+     * from Step 6) instead of a hardcoded literal specifically so Step 9's
+     * benchmarks can vary it and measure the effect directly, rather than
+     * asserting it matters without proof. Concurrency beyond the partition
+     * count is wasted - a 4th thread would never be assigned a partition
+     * to read from and would sit permanently idle.
      * <p>
      * @Transactional wraps everything below in one DB transaction. It does
      * NOT extend to the Kafka side - see CandidateEventProducer's Javadoc
@@ -81,7 +84,11 @@ public class CandidateProcessingConsumer {
      * it and recording it as a counted failure instead means the job can
      * always still reach COMPLETED, and the failure is visible, not lost.
      */
-    @KafkaListener(topics = KafkaTopics.CANDIDATE_PROCESSING, groupId = "candidate-processing-group", concurrency = "3")
+    @KafkaListener(
+            topics = KafkaTopics.CANDIDATE_PROCESSING,
+            groupId = "candidate-processing-group",
+            concurrency = "${recruitment.kafka.consumer-concurrency:3}"
+    )
     @Transactional
     public void onCandidateProcessingEvent(CandidateProcessingEvent event) {
         if (matchResultRepository.existsByProcessingJobIdAndCandidateId(
