@@ -137,6 +137,40 @@ class ProcessingJobControllerTest {
     }
 
     @Test
+    void createJobSynchronously_returnsAlreadyCompletedWithRankedResultsAvailableImmediately() throws Exception {
+        MockMultipartFile candidatesPart = new MockMultipartFile(
+                "candidates", "candidates.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                sampleWorkbookBytes());
+
+        String createResponseJson = mockMvc.perform(multipart("/api/processing/jobs/sync")
+                        .file(candidatesPart)
+                        .param("jobDescription", JOB_DESCRIPTION))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode createResponse = objectMapper.readTree(createResponseJson);
+        // Unlike the async endpoint, this really is done by the time the
+        // response comes back - no consumer, no race, no polling needed.
+        assertThat(createResponse.get("status").asText()).isEqualTo("COMPLETED");
+        UUID jobId = UUID.fromString(createResponse.get("jobId").asText());
+
+        String statusJson = mockMvc.perform(get("/api/processing/jobs/{jobId}", jobId))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode statusResponse = objectMapper.readTree(statusJson);
+        assertThat(statusResponse.get("processed").asInt()).isEqualTo(3);
+        assertThat(statusResponse.get("matched").asInt()).isEqualTo(2); // Rahul (0.68) + Neha (0.84)
+
+        String resultsJson = mockMvc.perform(get("/api/processing/jobs/{jobId}/results", jobId))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode results = objectMapper.readTree(resultsJson);
+        assertThat(results).hasSize(3);
+        assertThat(results.get(0).get("candidateId").asText()).isEqualTo("C003"); // Neha, highest score
+    }
+
+    @Test
     void malformedJobDescription_returns400WithoutTouchingTheDatabase() throws Exception {
         MockMultipartFile candidatesPart = new MockMultipartFile(
                 "candidates", "candidates.xlsx",

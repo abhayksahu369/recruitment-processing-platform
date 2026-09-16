@@ -14,6 +14,8 @@ import com.example.recruitment.dto.CandidateProcessingEvent;
 import com.example.recruitment.exception.MalformedExcelException;
 import com.example.recruitment.exception.ProcessingJobNotFoundException;
 import com.example.recruitment.kafka.CandidateEventProducer;
+import com.example.recruitment.matching.CandidateMatcher;
+import com.example.recruitment.matching.CandidateProfile;
 import com.example.recruitment.parser.ExcelParser;
 import com.example.recruitment.parser.JobDescriptionParser;
 import com.example.recruitment.repository.CandidateRepository;
@@ -33,24 +35,40 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * Orchestrates the "create a processing job" use case: parse the job
- * description and spreadsheet, persist the job and its candidates, and
- * hand each valid candidate off to Kafka for matching - all as one unit
- * of work (see the @Transactional note below).
+ * Orchestrates job creation, in two forms:
  * <p>
- * As of this step, this class no longer touches CandidateMatcher or
- * MatchResultRepository's write side at all - scoring a candidate moved
- * out of the request path entirely. It still reads MatchResultRepository
- * in getResults(), because whatever a consumer has finished so far is
- * exactly what a recruiter polling the status/results endpoints should
- * see.
+ * - createProcessingJob: parse, persist, hand every valid candidate to
+ *   Kafka, return immediately - the real, production pipeline from Step
+ *   6 onward.
+ * - createProcessingJobSynchronously: parse, persist, and match every
+ *   candidate right here in the request, with no Kafka involved at all -
+ *   reintroduced deliberately as a second, explicit code path purely so
+ *   the two approaches can be compared side by side (see
+ *   POST /api/processing/jobs/sync), not as a replacement for the async
+ *   one. This is intentionally the ONLY place CandidateMatcher is called
+ *   from the HTTP-facing side of the app; CandidateProcessingConsumer
+ *   calls it independently for the async path, and neither of those two
+ *   call sites knows the other exists - exactly the decoupling the
+ *   CandidateMatcher interface exists to provide.
  */
 @Service
 public class ProcessingJobService {
 
+    /**
+     * Matches Step 8's threshold in CandidateProcessingConsumer exactly.
+     * Duplicated rather than shared: two occurrences of one named
+     * constant isn't yet worth inventing a shared home for (the matching
+     * package doesn't define "matched" - that's a reporting decision the
+     * matcher itself stays deliberately silent on) - see this project's
+     * CsvSkills for the pattern of waiting for a third occurrence before
+     * extracting something shared.
+     */
+    private static final double MATCH_THRESHOLD = 0.5;
+
     private final JobDescriptionParser jobDescriptionParser;
     private final ExcelParser excelParser;
     private final CandidateEventProducer candidateEventProducer;
+    private final CandidateMatcher candidateMatcher;
     private final ProcessingJobRepository processingJobRepository;
     private final CandidateRepository candidateRepository;
     private final MatchResultRepository matchResultRepository;
@@ -59,6 +77,7 @@ public class ProcessingJobService {
             JobDescriptionParser jobDescriptionParser,
             ExcelParser excelParser,
             CandidateEventProducer candidateEventProducer,
+            CandidateMatcher candidateMatcher,
             ProcessingJobRepository processingJobRepository,
             CandidateRepository candidateRepository,
             MatchResultRepository matchResultRepository
@@ -66,6 +85,7 @@ public class ProcessingJobService {
         this.jobDescriptionParser = jobDescriptionParser;
         this.excelParser = excelParser;
         this.candidateEventProducer = candidateEventProducer;
+        this.candidateMatcher = candidateMatcher;
         this.processingJobRepository = processingJobRepository;
         this.candidateRepository = candidateRepository;
         this.matchResultRepository = matchResultRepository;
@@ -123,6 +143,66 @@ public class ProcessingJobService {
             processingJobRepository.markCompleted(job.getId(), Instant.now());
             job.setStatus(ProcessingStatus.COMPLETED);
         }
+
+        return new CreateProcessingJobResponse(job.getId(), job.getStatus(), job.getTotalCandidates());
+    }
+
+    /**
+     * The pre-Kafka approach: every candidate is matched and persisted
+     * before this method returns, so the response you get back is
+     * already the final one - status is COMPLETED, not QUEUED, because
+     * by the time the caller sees this response, it genuinely is. Exists
+     * to let you measure the same workload both ways; the production
+     * upload path is createProcessingJob, above.
+     * <p>
+     * @Transactional wraps the whole loop in one transaction, exactly
+     * like the original Step 5 implementation did - which is also why
+     * this doesn't scale the way the async path does: one very large
+     * spreadsheet means one very large transaction, held open for the
+     * entire request.
+     */
+    @Transactional
+    public CreateProcessingJobResponse createProcessingJobSynchronously(
+            String jobDescriptionText, MultipartFile excelFile) {
+        JobRequirements requirements = jobDescriptionParser.parse(jobDescriptionText);
+        ExcelParseResult parseResult = parseExcel(excelFile);
+
+        ProcessingJob job = processingJobRepository.save(ProcessingJob.builder()
+                .jobTitle(requirements.jobTitle())
+                .requiredSkills(CsvSkills.format(requirements.requiredSkills()))
+                .minExperience(requirements.minExperience())
+                .maxExperience(requirements.maxExperience())
+                .totalCandidates(parseResult.candidates().size() + parseResult.errors().size())
+                .failedCandidates(parseResult.errors().size())
+                .build());
+
+        int matchedCount = 0;
+        for (ParsedCandidate parsed : parseResult.candidates()) {
+            Candidate candidate = saveCandidate(job, parsed);
+
+            com.example.recruitment.matching.MatchResult outcome = candidateMatcher.match(
+                    new CandidateProfile(parsed.skills(), parsed.experience()), requirements);
+
+            matchResultRepository.save(com.example.recruitment.domain.MatchResult.builder()
+                    .processingJobId(job.getId())
+                    .candidateId(candidate.getId())
+                    .skillScore(outcome.skillScore())
+                    .experienceScore(outcome.experienceScore())
+                    .finalScore(outcome.finalScore())
+                    .matchedSkills(CsvSkills.format(outcome.matchedSkills()))
+                    .missingSkills(CsvSkills.format(outcome.missingSkills()))
+                    .build());
+
+            if (outcome.finalScore() >= MATCH_THRESHOLD) {
+                matchedCount++;
+            }
+        }
+
+        job.setProcessedCandidates(job.getTotalCandidates());
+        job.setMatchedCandidates(matchedCount);
+        job.setStatus(ProcessingStatus.COMPLETED);
+        job.setCompletedAt(Instant.now());
+        processingJobRepository.save(job);
 
         return new CreateProcessingJobResponse(job.getId(), job.getStatus(), job.getTotalCandidates());
     }

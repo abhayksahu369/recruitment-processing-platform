@@ -66,6 +66,23 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-kafka</artifactId>
 		</dependency>
+		<!-- spring-kafka's JsonSerializer/JsonDeserializer (used for our
+		     CandidateProcessingEvent messages) are built on classic Jackson
+		     2's ObjectMapper/JavaType, not Spring Boot 4's own Jackson 3
+		     (tools.jackson.*) - the two Jackson major versions coexist
+		     under different Maven coordinates. Without this, the app
+		     starts fine under `mvn test` (some test-scope dependency
+		     happens to pull classic Jackson 2 in transitively, masking the
+		     gap) but fails at actual runtime with a NoClassDefFoundError
+		     the moment the Kafka listener container tries to construct a
+		     consumer - caught by actually running the app, not just the
+		     test suite. Version pinned to match what was already resolving
+		     at test scope. -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+			<version>2.21.5</version>
+		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-data-jpa-test</artifactId>

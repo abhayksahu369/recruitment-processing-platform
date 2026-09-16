@@ -45,6 +45,24 @@ public class ProcessingJobController {
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
+    /**
+     * Same request shape as the async endpoint above - same field names,
+     * same multipart layout - but this one blocks until every candidate
+     * is actually matched, and the response you get back already has
+     * status COMPLETED. Exists to let you compare the two approaches on
+     * the same data through Postman/curl directly, not as a replacement
+     * for the real (async) upload path.
+     */
+    @PostMapping(value = "/sync", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<CreateProcessingJobResponse> createJobSynchronously(
+            @RequestParam("jobDescription") String jobDescription,
+            @RequestParam("candidates") MultipartFile candidatesFile
+    ) {
+        CreateProcessingJobResponse response =
+                processingJobService.createProcessingJobSynchronously(jobDescription, candidatesFile);
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
     @GetMapping("/{jobId}")
     public ProcessingJobStatusResponse getStatus(@PathVariable UUID jobId) {
         return processingJobService.getStatus(jobId);
